@@ -47,7 +47,7 @@ jobs:
           logoFile="logo.png"
           authors="${mod_authors}"
           description='''
-          Unlocks blocks that exist in a mod but have no item, so they cannot be placed. Out of the box it targets the couplers and other loose blocks of Loconautics. Also switches on the Loconautics experimental features (steam, diesel, industrial fluids, screw link, handbrake) so those blocks can be placed. Adds a creative tab with every unlocked block, a /test command and a config to choose which mods to scan.
+          Unlocks blocks that exist in vanilla or any mod but have no item, so they cannot be placed (couplers and other loose blocks of Loconautics included). Also switches on the Loconautics experimental features (steam, diesel, industrial fluids, screw link, handbrake) so those blocks can be placed. Adds a creative tab with every unlocked block, and a /test command that builds an endless row of chests holding every unused block, item, armor piece and mob. Config to choose which mods to scan.
           '''
 
           [[dependencies.${mod_id}]]
@@ -143,6 +143,8 @@ jobs:
                   TABS.register(modBus);
 
                   NeoForge.EVENT_BUS.addListener(TestCommand::onRegisterCommands);
+                  NeoForge.EVENT_BUS.addListener(TestCommand::onServerTick);
+                  NeoForge.EVENT_BUS.addListener(TestCommand::onServerStopped);
 
                   if (FMLEnvironment.dist == Dist.CLIENT) {
                       modBus.addListener(ClientHooks::onModifyBaking);
@@ -158,13 +160,14 @@ jobs:
                   }
 
                   List<String> namespaces = Config.namespaces();
+                  boolean allMods = namespaces.contains("*");
                   List<ResourceLocation> ids = new ArrayList<>();
                   List<Block> blocks = new ArrayList<>();
                   for (Map.Entry<net.minecraft.resources.ResourceKey<Block>, Block> e : BuiltInRegistries.BLOCK.entrySet()) {
                       ResourceLocation id = e.getKey().location();
                       Block block = e.getValue();
-                      if (!namespaces.contains(id.getNamespace())) continue;
-                      if (alreadyHaveItem.contains(block)) continue;
+                      if (!allMods && !namespaces.contains(id.getNamespace())) continue;
+                      if (alreadyHaveItem.contains(block) || block.asItem() != Items.AIR) continue;
                       if (block instanceof LiquidBlock) continue;
                       if (block.defaultBlockState().isAir()) continue;
                       ids.add(id);
@@ -234,8 +237,9 @@ jobs:
               static {
                   ModConfigSpec.Builder b = new ModConfigSpec.Builder();
                   NAMESPACES = b
-                      .comment("Mod ids to scan. Every block from these mods that has no item gets a placeable item.")
-                      .defineListAllowEmpty("namespaces", List.of("loconautics"), () -> "loconautics", o -> o instanceof String);
+                      .comment("Mod ids to scan (use \"minecraft\" for vanilla). \"*\" means every mod and vanilla.",
+                          "Every block from these mods that has no item gets a placeable item.")
+                      .defineListAllowEmpty("unlockNamespaces", List.of("*"), () -> "*", o -> o instanceof String);
                   SPEC = b.build();
               }
 
@@ -246,7 +250,7 @@ jobs:
                       return new ArrayList<>(NAMESPACES.get());
                   } catch (Throwable t) {
                       // config not loaded yet at registry time: use the default
-                      return new ArrayList<>(List.of("loconautics"));
+                      return new ArrayList<>(List.of("*"));
                   }
               }
           }
@@ -255,10 +259,12 @@ jobs:
           cat > src/main/java/com/unusedunlocked/TestCommand.java <<'TESTCOMMAND_EOF'
           package com.unusedunlocked;
 
+          import java.util.ArrayDeque;
           import java.util.ArrayList;
           import java.util.HashSet;
           import java.util.List;
           import java.util.Set;
+          import java.util.UUID;
 
           import com.mojang.brigadier.exceptions.CommandSyntaxException;
 
@@ -266,58 +272,116 @@ jobs:
           import net.minecraft.commands.Commands;
           import net.minecraft.core.BlockPos;
           import net.minecraft.core.Direction;
+          import net.minecraft.core.component.DataComponents;
           import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.nbt.CompoundTag;
           import net.minecraft.network.chat.Component;
           import net.minecraft.resources.ResourceLocation;
           import net.minecraft.server.level.ServerLevel;
           import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.EntityType;
+          import net.minecraft.world.entity.LivingEntity;
           import net.minecraft.world.item.ArmorItem;
           import net.minecraft.world.item.BlockItem;
+          import net.minecraft.world.item.CreativeModeTabs;
           import net.minecraft.world.item.Item;
           import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.item.SpawnEggItem;
+          import net.minecraft.world.item.component.CustomData;
           import net.minecraft.world.item.crafting.RecipeHolder;
           import net.minecraft.world.level.block.Blocks;
           import net.minecraft.world.level.block.ChestBlock;
           import net.minecraft.world.level.block.entity.BlockEntity;
           import net.minecraft.world.level.block.entity.ChestBlockEntity;
           import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.levelgen.Heightmap;
           import net.neoforged.neoforge.event.RegisterCommandsEvent;
+          import net.neoforged.neoforge.event.server.ServerStoppedEvent;
+          import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
           /**
-           * /test : puts chests in front of you holding every unused block, item and armor piece
-           * (unlocked blocks, plus anything from the scanned mods that has no crafting recipe).
-           * Blocks, armor and other items each get their own row of chests.
+           * /test : starts an endless row of chests in front of you holding every unused block, item,
+           * armor piece and mob (as a spawn egg) from vanilla Minecraft and every installed mod.
+           * The row keeps growing a few chests per tick until nothing is left. /test stop cancels it.
+           *
+           * Unused item = not shown in any creative tab and not the result of any recipe
+           * (plus every placeholder item this mod unlocked). Unused mob = a living entity with no spawn egg.
            */
           public final class TestCommand {
-              private static final int PER_ROW = 8;
+              private static final int CHESTS_PER_TICK = 4;
+              private static final int REPORT_EVERY = 100;
+
+              private static final class Job {
+                  ServerLevel level;
+                  UUID playerId;
+                  Direction dir;
+                  BlockPos base;
+                  ArrayDeque<List<ItemStack>> chests = new ArrayDeque<>();
+                  int placed;
+                  int total;
+                  int lastReport;
+              }
+
+              private static Job job;
 
               private TestCommand() {}
 
               public static void onRegisterCommands(RegisterCommandsEvent event) {
-                  event.getDispatcher().register(Commands.literal("test").executes(ctx -> run(ctx.getSource())));
+                  event.getDispatcher().register(Commands.literal("test")
+                      .executes(ctx -> start(ctx.getSource()))
+                      .then(Commands.literal("stop").executes(ctx -> stop(ctx.getSource()))));
               }
 
-              private static int run(CommandSourceStack source) throws CommandSyntaxException {
+              public static void onServerStopped(ServerStoppedEvent event) {
+                  job = null;
+              }
+
+              private static int stop(CommandSourceStack source) {
+                  if (job == null) {
+                      source.sendFailure(Component.literal("No chest row is being built."));
+                      return 0;
+                  }
+                  final int placed = job.placed;
+                  job = null;
+                  source.sendSuccess(() -> Component.literal("Stopped after " + placed + " chests."), false);
+                  return placed;
+              }
+
+              private static int start(CommandSourceStack source) throws CommandSyntaxException {
                   ServerPlayer player = source.getPlayerOrException();
                   ServerLevel level = source.getLevel();
 
-                  Set<Item> craftable = new HashSet<>();
-                  for (RecipeHolder<?> holder : level.getRecipeManager().getRecipes()) {
-                      ItemStack out = holder.value().getResultItem(level.registryAccess());
-                      if (!out.isEmpty()) craftable.add(out.getItem());
+                  // what the player can already get in creative
+                  Set<Item> visible = new HashSet<>();
+                  try {
+                      CreativeModeTabs.tryRebuildTabContents(level.enabledFeatures(), false, level.registryAccess());
+                      for (ItemStack s : CreativeModeTabs.searchTab().getSearchTabDisplayItems()) visible.add(s.getItem());
+                  } catch (Throwable t) {
+                      UnusedUnlocked.LOGGER.warn("Could not read creative tabs, using recipes only", t);
                   }
 
-                  List<String> namespaces = new ArrayList<>(Config.namespaces());
-                  namespaces.add(UnusedUnlocked.MODID);
+                  Set<Item> craftable = new HashSet<>();
+                  for (RecipeHolder<?> holder : level.getRecipeManager().getRecipes()) {
+                      try {
+                          ItemStack out = holder.value().getResultItem(level.registryAccess());
+                          if (!out.isEmpty()) craftable.add(out.getItem());
+                      } catch (Throwable ignored) {
+                          // a broken modded recipe must not stop the command
+                      }
+                  }
 
                   List<ItemStack> blocks = new ArrayList<>();
                   List<ItemStack> armor = new ArrayList<>();
                   List<ItemStack> items = new ArrayList<>();
+                  List<ItemStack> mobs = new ArrayList<>();
+
                   for (Item item : BuiltInRegistries.ITEM) {
-                      ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
-                      if (!namespaces.contains(id.getNamespace())) continue;
-                      boolean unused = UnusedUnlocked.UNLOCKED.containsKey(item) || !craftable.contains(item);
-                      if (!unused) continue;
+                      if (item == Items.AIR) continue;
+                      boolean unlocked = UnusedUnlocked.UNLOCKED.containsKey(item);
+                      boolean inCreative = !visible.isEmpty() && visible.contains(item);
+                      if (!unlocked && (inCreative || craftable.contains(item))) continue;
                       ItemStack stack = new ItemStack(item);
                       stack.setCount(stack.getMaxStackSize());
                       if (item instanceof ArmorItem) armor.add(stack);
@@ -325,53 +389,99 @@ jobs:
                       else items.add(stack);
                   }
 
-                  Direction dir = player.getDirection();
-                  Direction right = dir.getClockWise();
-                  BlockPos base = player.blockPosition().relative(dir, 3);
-
-                  int index = 0;
-                  index = placeChests(level, base, dir, right, index, blocks);
-                  index = placeChests(level, base, dir, right, index, armor);
-                  index = placeChests(level, base, dir, right, index, items);
-
-                  final int total = blocks.size() + armor.size() + items.size();
-                  if (total == 0) {
-                      source.sendFailure(Component.literal("No unused blocks, items or armor found in: " + namespaces));
-                      return 0;
+                  for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
+                      try {
+                          if (!type.canSummon()) continue;
+                          if (SpawnEggItem.byId(type) != null) continue;
+                          Entity probe = type.create(level);
+                          if (!(probe instanceof LivingEntity)) continue;
+                          ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(type);
+                          CompoundTag tag = new CompoundTag();
+                          tag.putString("id", id.toString());
+                          ItemStack egg = new ItemStack(Items.PIG_SPAWN_EGG);
+                          egg.set(DataComponents.ENTITY_DATA, CustomData.of(tag));
+                          egg.set(DataComponents.CUSTOM_NAME, Component.literal("Spawn ").append(type.getDescription()));
+                          mobs.add(egg);
+                      } catch (Throwable ignored) {
+                          // some modded entities cannot be created without a real world
+                      }
                   }
+
+                  Job j = new Job();
+                  j.level = level;
+                  j.playerId = player.getUUID();
+                  j.dir = player.getDirection();
+                  j.base = player.blockPosition().relative(j.dir, 3);
+                  addChests(j, blocks);
+                  addChests(j, armor);
+                  addChests(j, items);
+                  addChests(j, mobs);
+                  j.total = j.chests.size();
+
                   final int nb = blocks.size();
                   final int na = armor.size();
                   final int ni = items.size();
-                  source.sendSuccess(() -> Component.literal("Spawned chests with " + nb + " blocks, "
-                      + na + " armor, " + ni + " items in front of you."), false);
-                  return total;
+                  final int nm = mobs.size();
+                  if (j.total == 0) {
+                      source.sendFailure(Component.literal("Nothing unused was found."));
+                      return 0;
+                  }
+                  job = j;
+                  final int chestCount = j.total;
+                  source.sendSuccess(() -> Component.literal("Building a row of " + chestCount + " chests: " + nb
+                      + " blocks, " + na + " armor, " + ni + " items, " + nm + " mobs. Use /test stop to cancel."), false);
+                  return chestCount;
               }
 
-              /** Fills chests with the stacks, 27 per chest, starting at a fresh row. Returns the next free chest index. */
-              private static int placeChests(ServerLevel level, BlockPos base, Direction dir, Direction right,
-                                             int startIndex, List<ItemStack> stacks) {
-                  if (stacks.isEmpty()) return startIndex;
-                  int index = ((startIndex + PER_ROW - 1) / PER_ROW) * PER_ROW; // start a new row
-                  BlockState chestState = Blocks.CHEST.defaultBlockState().setValue(ChestBlock.FACING, dir.getOpposite());
-
+              private static void addChests(Job j, List<ItemStack> stacks) {
                   for (int from = 0; from < stacks.size(); from += 27) {
-                      int col = index % PER_ROW;
-                      int row = index / PER_ROW;
-                      BlockPos pos = base.relative(right, col * 2).relative(dir, row * 2);
-
-                      level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3); // room to open the lid
-                      level.setBlock(pos, chestState, 3);
-                      BlockEntity be = level.getBlockEntity(pos);
-                      if (be instanceof ChestBlockEntity chest) {
-                          int slots = Math.min(27, stacks.size() - from);
-                          for (int j = 0; j < slots; j++) {
-                              chest.setItem(j, stacks.get(from + j).copy());
-                          }
-                          chest.setChanged();
-                      }
-                      index++;
+                      int to = Math.min(from + 27, stacks.size());
+                      j.chests.add(new ArrayList<>(stacks.subList(from, to)));
                   }
-                  return index;
+              }
+
+              public static void onServerTick(ServerTickEvent.Post event) {
+                  Job j = job;
+                  if (j == null) return;
+
+                  try {
+                      for (int n = 0; n < CHESTS_PER_TICK && !j.chests.isEmpty(); n++) {
+                          placeChest(j, j.chests.poll());
+                          j.placed++;
+                      }
+                  } catch (Throwable t) {
+                      UnusedUnlocked.LOGGER.error("Chest row stopped because of an error", t);
+                      job = null;
+                      return;
+                  }
+
+                  ServerPlayer player = event.getServer().getPlayerList().getPlayer(j.playerId);
+                  if (j.chests.isEmpty()) {
+                      job = null;
+                      if (player != null) {
+                          final int total = j.total;
+                          player.sendSystemMessage(Component.literal("Done: " + total + " chests placed."));
+                      }
+                  } else if (player != null && j.placed - j.lastReport >= REPORT_EVERY) {
+                      j.lastReport = j.placed;
+                      player.sendSystemMessage(Component.literal(j.placed + " / " + j.total + " chests placed..."));
+                  }
+              }
+
+              private static void placeChest(Job j, List<ItemStack> contents) {
+                  BlockPos flat = j.base.relative(j.dir, j.placed * 2);
+                  BlockPos pos = j.level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, flat);
+                  BlockState chestState = Blocks.CHEST.defaultBlockState().setValue(ChestBlock.FACING, j.dir.getOpposite());
+
+                  j.level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3); // room to open the lid
+                  j.level.setBlock(pos, chestState, 3);
+                  BlockEntity be = j.level.getBlockEntity(pos);
+                  if (be instanceof ChestBlockEntity chest) {
+                      for (int i = 0; i < contents.size(); i++) {
+                          chest.setItem(i, contents.get(i).copy());
+                      }
+                      chest.setChanged();
+                  }
               }
           }
           TESTCOMMAND_EOF
@@ -499,6 +609,6 @@ jobs:
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: unused-unlocked-1.4.0
+          name: unused-unlocked-1.5.0
           path: build/libs/*.jar
           if-no-files-found: error
