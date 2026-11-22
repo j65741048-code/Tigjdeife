@@ -1,0 +1,58 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+// Everything is defined here so no gradle.properties is needed
+def modId = 'unusedunlocked'
+def modName = 'Unused Unlocked'
+def modVersion = '1.4.0'
+def modGroupId = 'com.unusedunlocked'
+def modAuthors = 'you'
+def modLicense = 'MIT'
+def minecraftVersion = '1.21.1'
+def neoVersion = '21.1.172'
+def neoVersionRange = '[21.1.0,)'
+
+version = modVersion
+group = modGroupId
+
+base {
+    archivesName = modId
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+repositories {
+    mavenCentral()
+}
+
+neoForge {
+    version = neoVersion
+
+    mods {
+        "${modId}" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+        minecraft_version  : minecraftVersion,
+        neo_version_range  : neoVersionRange,
+        mod_id             : modId,
+        mod_name           : modName,
+        mod_version        : modVersion,
+        mod_authors        : modAuthors,
+        mod_license        : modLicense
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand replaceProperties
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
