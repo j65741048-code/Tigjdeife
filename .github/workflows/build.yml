@@ -1,1 +1,504 @@
+name: build
 
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write mod files and icon
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src/main/java/com/unusedunlocked
+          mkdir -p src/main/resources/META-INF
+          mkdir -p src/main/resources/assets/unusedunlocked/lang
+
+          cat > settings.gradle <<'SETTINGS_EOF'
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  mavenCentral()
+                  maven { url = 'https://maven.neoforged.net/releases' }
+              }
+          }
+
+          rootProject.name = 'unused-unlocked'
+          SETTINGS_EOF
+
+          cat > src/main/resources/META-INF/neoforge.mods.toml <<'TOML_EOF'
+          modLoader="javafml"
+          loaderVersion="[1,)"
+          license="${mod_license}"
+
+          [[mods]]
+          modId="${mod_id}"
+          version="${mod_version}"
+          displayName="${mod_name}"
+          logoFile="logo.png"
+          authors="${mod_authors}"
+          description='''
+          Unlocks blocks that exist in a mod but have no item, so they cannot be placed. Out of the box it targets the couplers and other loose blocks of Loconautics. Also switches on the Loconautics experimental features (steam, diesel, industrial fluids, screw link, handbrake) so those blocks can be placed. Adds a creative tab with every unlocked block, a /test command and a config to choose which mods to scan.
+          '''
+
+          [[dependencies.${mod_id}]]
+          modId="loconautics"
+          type="optional"
+          versionRange="[0,)"
+          ordering="BEFORE"
+          side="BOTH"
+
+          [[dependencies.${mod_id}]]
+          modId="neoforge"
+          type="required"
+          versionRange="${neo_version_range}"
+          ordering="NONE"
+          side="BOTH"
+
+          [[dependencies.${mod_id}]]
+          modId="minecraft"
+          type="required"
+          versionRange="[${minecraft_version}]"
+          ordering="NONE"
+          side="BOTH"
+          TOML_EOF
+
+          cat > src/main/resources/assets/unusedunlocked/lang/en_us.json <<'LANG_EOF'
+          {
+            "itemGroup.unusedunlocked": "Unused Unlocked"
+          }
+          LANG_EOF
+
+          cat > src/main/java/com/unusedunlocked/UnusedUnlocked.java <<'UNUSEDUNLOCKED_EOF'
+          package com.unusedunlocked;
+
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+
+          import org.slf4j.Logger;
+
+          import com.mojang.logging.LogUtils;
+
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.world.item.BlockItem;
+          import net.minecraft.world.item.CreativeModeTab;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.level.block.Block;
+          import net.minecraft.world.level.block.LiquidBlock;
+          import net.neoforged.api.distmarker.Dist;
+          import net.neoforged.bus.api.EventPriority;
+          import net.neoforged.bus.api.IEventBus;
+          import net.neoforged.fml.ModContainer;
+          import net.neoforged.fml.common.Mod;
+          import net.neoforged.fml.config.ModConfig;
+          import net.neoforged.fml.loading.FMLEnvironment;
+          import net.neoforged.neoforge.common.NeoForge;
+          import net.neoforged.neoforge.registries.DeferredRegister;
+          import net.neoforged.neoforge.registries.RegisterEvent;
+
+          @Mod(UnusedUnlocked.MODID)
+          public class UnusedUnlocked {
+              public static final String MODID = "unusedunlocked";
+              public static final Logger LOGGER = LogUtils.getLogger();
+
+              /** item -> block it places, filled while the item registry is being built */
+              public static final Map<Item, Block> UNLOCKED = new LinkedHashMap<>();
+
+              private static final DeferredRegister<CreativeModeTab> TABS =
+                  DeferredRegister.create(Registries.CREATIVE_MODE_TAB, MODID);
+
+              public UnusedUnlocked(IEventBus modBus, ModContainer container) {
+                  // must run before Loconautics reads its own config
+                  LoconauticsUnlocker.enableExperimentalFeatures();
+
+                  container.registerConfig(ModConfig.Type.COMMON, Config.SPEC);
+
+                  // lowest priority so every other mod has already registered its items
+                  modBus.addListener(EventPriority.LOWEST, this::onRegister);
+
+                  TABS.register("unlocked", () -> CreativeModeTab.builder()
+                      .title(Component.translatable("itemGroup." + MODID))
+                      .icon(() -> UNLOCKED.isEmpty() ? new ItemStack(Items.POWERED_RAIL)
+                          : new ItemStack(UNLOCKED.keySet().iterator().next()))
+                      .displayItems((params, output) -> UNLOCKED.keySet().forEach(output::accept))
+                      .build());
+                  TABS.register(modBus);
+
+                  NeoForge.EVENT_BUS.addListener(TestCommand::onRegisterCommands);
+
+                  if (FMLEnvironment.dist == Dist.CLIENT) {
+                      modBus.addListener(ClientHooks::onModifyBaking);
+                  }
+              }
+
+              private void onRegister(RegisterEvent event) {
+                  if (!event.getRegistryKey().equals(Registries.ITEM)) return;
+
+                  Set<Block> alreadyHaveItem = new HashSet<>();
+                  for (Item item : BuiltInRegistries.ITEM) {
+                      if (item instanceof BlockItem bi) alreadyHaveItem.add(bi.getBlock());
+                  }
+
+                  List<String> namespaces = Config.namespaces();
+                  List<ResourceLocation> ids = new ArrayList<>();
+                  List<Block> blocks = new ArrayList<>();
+                  for (Map.Entry<net.minecraft.resources.ResourceKey<Block>, Block> e : BuiltInRegistries.BLOCK.entrySet()) {
+                      ResourceLocation id = e.getKey().location();
+                      Block block = e.getValue();
+                      if (!namespaces.contains(id.getNamespace())) continue;
+                      if (alreadyHaveItem.contains(block)) continue;
+                      if (block instanceof LiquidBlock) continue;
+                      if (block.defaultBlockState().isAir()) continue;
+                      ids.add(id);
+                      blocks.add(block);
+                  }
+
+                  event.register(Registries.ITEM, helper -> {
+                      for (int i = 0; i < blocks.size(); i++) {
+                          ResourceLocation src = ids.get(i);
+                          Block block = blocks.get(i);
+                          Item item = new BlockItem(block, new Item.Properties());
+                          helper.register(ResourceLocation.fromNamespaceAndPath(MODID, src.getNamespace() + "_" + src.getPath()), item);
+                          UNLOCKED.put(item, block);
+                          LOGGER.info("Unlocked {} -> {}", src, MODID + ":" + src.getNamespace() + "_" + src.getPath());
+                      }
+                      LOGGER.info("Unused Unlocked: {} block(s) unlocked from {}", blocks.size(), namespaces);
+                  });
+              }
+          }
+          UNUSEDUNLOCKED_EOF
+
+          cat > src/main/java/com/unusedunlocked/ClientHooks.java <<'CLIENTHOOKS_EOF'
+          package com.unusedunlocked;
+
+          import java.util.Map;
+
+          import net.minecraft.client.renderer.block.BlockModelShaper;
+          import net.minecraft.client.resources.model.BakedModel;
+          import net.minecraft.client.resources.model.ModelResourceLocation;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.level.block.Block;
+          import net.neoforged.neoforge.client.event.ModelEvent;
+
+          /** Gives every unlocked item the model of the block it places, so it is not a purple cube. */
+          public final class ClientHooks {
+              private ClientHooks() {}
+
+              public static void onModifyBaking(ModelEvent.ModifyBakingResult event) {
+                  Map<ModelResourceLocation, BakedModel> models = event.getModels();
+                  for (Map.Entry<Item, Block> e : UnusedUnlocked.UNLOCKED.entrySet()) {
+                      try {
+                          ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(e.getKey());
+                          BakedModel blockModel = models.get(BlockModelShaper.stateToModelLocation(e.getValue().defaultBlockState()));
+                          if (blockModel != null) models.put(ModelResourceLocation.inventory(itemId), blockModel);
+                      } catch (Throwable t) {
+                          UnusedUnlocked.LOGGER.warn("Could not set item model for {}", e.getKey(), t);
+                      }
+                  }
+              }
+          }
+          CLIENTHOOKS_EOF
+
+          cat > src/main/java/com/unusedunlocked/Config.java <<'CONFIG_EOF'
+          package com.unusedunlocked;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          import net.neoforged.neoforge.common.ModConfigSpec;
+
+          public final class Config {
+              public static final ModConfigSpec SPEC;
+              private static final ModConfigSpec.ConfigValue<List<? extends String>> NAMESPACES;
+
+              static {
+                  ModConfigSpec.Builder b = new ModConfigSpec.Builder();
+                  NAMESPACES = b
+                      .comment("Mod ids to scan. Every block from these mods that has no item gets a placeable item.")
+                      .defineListAllowEmpty("namespaces", List.of("loconautics"), () -> "loconautics", o -> o instanceof String);
+                  SPEC = b.build();
+              }
+
+              private Config() {}
+
+              public static List<String> namespaces() {
+                  try {
+                      return new ArrayList<>(NAMESPACES.get());
+                  } catch (Throwable t) {
+                      // config not loaded yet at registry time: use the default
+                      return new ArrayList<>(List.of("loconautics"));
+                  }
+              }
+          }
+          CONFIG_EOF
+
+          cat > src/main/java/com/unusedunlocked/TestCommand.java <<'TESTCOMMAND_EOF'
+          package com.unusedunlocked;
+
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+
+          import com.mojang.brigadier.exceptions.CommandSyntaxException;
+
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.item.ArmorItem;
+          import net.minecraft.world.item.BlockItem;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.crafting.RecipeHolder;
+          import net.minecraft.world.level.block.Blocks;
+          import net.minecraft.world.level.block.ChestBlock;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+          import net.minecraft.world.level.block.entity.ChestBlockEntity;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.neoforged.neoforge.event.RegisterCommandsEvent;
+
+          /**
+           * /test : puts chests in front of you holding every unused block, item and armor piece
+           * (unlocked blocks, plus anything from the scanned mods that has no crafting recipe).
+           * Blocks, armor and other items each get their own row of chests.
+           */
+          public final class TestCommand {
+              private static final int PER_ROW = 8;
+
+              private TestCommand() {}
+
+              public static void onRegisterCommands(RegisterCommandsEvent event) {
+                  event.getDispatcher().register(Commands.literal("test").executes(ctx -> run(ctx.getSource())));
+              }
+
+              private static int run(CommandSourceStack source) throws CommandSyntaxException {
+                  ServerPlayer player = source.getPlayerOrException();
+                  ServerLevel level = source.getLevel();
+
+                  Set<Item> craftable = new HashSet<>();
+                  for (RecipeHolder<?> holder : level.getRecipeManager().getRecipes()) {
+                      ItemStack out = holder.value().getResultItem(level.registryAccess());
+                      if (!out.isEmpty()) craftable.add(out.getItem());
+                  }
+
+                  List<String> namespaces = new ArrayList<>(Config.namespaces());
+                  namespaces.add(UnusedUnlocked.MODID);
+
+                  List<ItemStack> blocks = new ArrayList<>();
+                  List<ItemStack> armor = new ArrayList<>();
+                  List<ItemStack> items = new ArrayList<>();
+                  for (Item item : BuiltInRegistries.ITEM) {
+                      ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                      if (!namespaces.contains(id.getNamespace())) continue;
+                      boolean unused = UnusedUnlocked.UNLOCKED.containsKey(item) || !craftable.contains(item);
+                      if (!unused) continue;
+                      ItemStack stack = new ItemStack(item);
+                      stack.setCount(stack.getMaxStackSize());
+                      if (item instanceof ArmorItem) armor.add(stack);
+                      else if (item instanceof BlockItem) blocks.add(stack);
+                      else items.add(stack);
+                  }
+
+                  Direction dir = player.getDirection();
+                  Direction right = dir.getClockWise();
+                  BlockPos base = player.blockPosition().relative(dir, 3);
+
+                  int index = 0;
+                  index = placeChests(level, base, dir, right, index, blocks);
+                  index = placeChests(level, base, dir, right, index, armor);
+                  index = placeChests(level, base, dir, right, index, items);
+
+                  final int total = blocks.size() + armor.size() + items.size();
+                  if (total == 0) {
+                      source.sendFailure(Component.literal("No unused blocks, items or armor found in: " + namespaces));
+                      return 0;
+                  }
+                  final int nb = blocks.size();
+                  final int na = armor.size();
+                  final int ni = items.size();
+                  source.sendSuccess(() -> Component.literal("Spawned chests with " + nb + " blocks, "
+                      + na + " armor, " + ni + " items in front of you."), false);
+                  return total;
+              }
+
+              /** Fills chests with the stacks, 27 per chest, starting at a fresh row. Returns the next free chest index. */
+              private static int placeChests(ServerLevel level, BlockPos base, Direction dir, Direction right,
+                                             int startIndex, List<ItemStack> stacks) {
+                  if (stacks.isEmpty()) return startIndex;
+                  int index = ((startIndex + PER_ROW - 1) / PER_ROW) * PER_ROW; // start a new row
+                  BlockState chestState = Blocks.CHEST.defaultBlockState().setValue(ChestBlock.FACING, dir.getOpposite());
+
+                  for (int from = 0; from < stacks.size(); from += 27) {
+                      int col = index % PER_ROW;
+                      int row = index / PER_ROW;
+                      BlockPos pos = base.relative(right, col * 2).relative(dir, row * 2);
+
+                      level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3); // room to open the lid
+                      level.setBlock(pos, chestState, 3);
+                      BlockEntity be = level.getBlockEntity(pos);
+                      if (be instanceof ChestBlockEntity chest) {
+                          int slots = Math.min(27, stacks.size() - from);
+                          for (int j = 0; j < slots; j++) {
+                              chest.setItem(j, stacks.get(from + j).copy());
+                          }
+                          chest.setChanged();
+                      }
+                      index++;
+                  }
+                  return index;
+              }
+          }
+          TESTCOMMAND_EOF
+
+          cat > src/main/java/com/unusedunlocked/LoconauticsUnlocker.java <<'LOCONAUTICSUNLOCKER_EOF'
+          package com.unusedunlocked;
+
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          import net.neoforged.fml.loading.FMLPaths;
+
+          /**
+           * Loconautics ships "experimental" features (boilerworks, dieselworks, industrialFluids, screwLink, handbrake)
+           * that are OFF by default: their items cannot be placed or used, are hidden and have no recipes.
+           * This switches them all on in config/loconautics-experimental.toml before Loconautics reads it.
+           */
+          public final class LoconauticsUnlocker {
+              private static final String FILE = "loconautics-experimental.toml";
+              private static final String SECTION = "[experimental]";
+              private static final String[] KEYS = {"boilerworks", "dieselworks", "industrialFluids", "screwLink", "handbrake"};
+
+              private LoconauticsUnlocker() {}
+
+              public static void enableExperimentalFeatures() {
+                  try {
+                      Path path = FMLPaths.CONFIGDIR.get().resolve(FILE);
+                      List<String> lines = Files.exists(path)
+                          ? new ArrayList<>(Files.readAllLines(path, StandardCharsets.UTF_8))
+                          : new ArrayList<>();
+
+                      boolean changed = false;
+                      List<String> missing = new ArrayList<>();
+                      for (String key : KEYS) {
+                          Pattern pattern = Pattern.compile("^(\\s*" + Pattern.quote(key) + "\\s*=\\s*)(true|false)(.*)$");
+                          boolean found = false;
+                          for (int i = 0; i < lines.size(); i++) {
+                              Matcher m = pattern.matcher(lines.get(i));
+                              if (m.matches()) {
+                                  found = true;
+                                  if (!m.group(2).equals("true")) {
+                                      lines.set(i, m.group(1) + "true" + m.group(3));
+                                      changed = true;
+                                  }
+                                  break;
+                              }
+                          }
+                          if (!found) missing.add(key);
+                      }
+
+                      if (!missing.isEmpty()) {
+                          int header = -1;
+                          for (int i = 0; i < lines.size(); i++) {
+                              if (lines.get(i).trim().equals(SECTION)) {
+                                  header = i;
+                                  break;
+                              }
+                          }
+                          if (header < 0) {
+                              lines.add(SECTION);
+                              header = lines.size() - 1;
+                          }
+                          for (String key : missing) {
+                              lines.add(header + 1, "\t" + key + " = true");
+                          }
+                          changed = true;
+                      }
+
+                      if (changed) {
+                          Files.createDirectories(path.getParent());
+                          Files.write(path, lines, StandardCharsets.UTF_8);
+                          UnusedUnlocked.LOGGER.info("Unused Unlocked: enabled the Loconautics experimental features in {}", path);
+                      }
+                  } catch (Throwable t) {
+                      UnusedUnlocked.LOGGER.warn("Unused Unlocked: could not update {}", FILE, t);
+                  }
+              }
+          }
+          LOCONAUTICSUNLOCKER_EOF
+
+          # icon (brass padlock on rails), shown in the mod list
+          echo "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADTUlEQVR4nO3cMWgTURzHcVM6iINIyNChgxQRCg4OpVMHhw7iIOIsHTo4dhKHIk7iJA4ugqM4iziIQweH4CAdHARBQnAqGUJwEEfraO8Fcjze3b27fL+f7XLJ3SP58X//vDuudy7SYG3jNPYzas50Mu7FvH+lroGoGwwAnAGAWy17Qzjn9wdr9Y1GVSj8XmU9gRUAzgDAGQC4ufnBOX+5zKaTwnbYE1gB4AwAnAGA6znns4Q9gRUAzgDAGQC40msBbbMy+5p7CAv97V/PPYQoVgA4AwBnAOA61wOEDp68rvX4Lx7tLTxfuD/Vuwd/Ctt3nl2o9PghKwCcAYAzAHCd7wHCOXjr5v3C9vHHV00OJ1o4529ubwf7vxS2q+4JrABwBgDOAMB1vgco+1+eujZf97WHcE6ve84PWQHgDACcAYCrvAdoei27aVWv/Yea/r6sAHAGAM4AwCX3ALnXsuvWtXv8YlkB4AwAnAGAS+4Bcq9lK40VAM4AwBkAuMqvBTjn16vqay1WADgDAGcA4Dp/T+Cyq/taixUAzgDAGQC41j0nsO3PAKpa7P0GqesAPidQBQYAzgDAtX4d4PvRvdxDqNTm7pukz/t8AFXKAMAZADgDAGcA4AwAnAGAa/06QJmXzz8Utm/sDBo9/6fhNOv5U1kB4AwAnAGA63wPEDvn3j38EfX+t0+vVnr+trECwBkAOAMAN9cDXLyUd077Pct6+sY1/X17T6AKDACcAYAzAHAGAM4AwBkAuM5fC4gVru2H1wbK1v6XjRUAzgDAGQC4zvcAue/Jy33+VFYAOAMAZwDgOt8DhMI5uczBrX7S51PPn5sVAM4AwBkAOAMAZwDgDACcAYBr/TpA6nP1tJgVAM4AwBkAuLkeYH9/L8c4zsh9/uX2+PBhYdsKAGcA4AwAnAGAMwBwBgDOAMDNrQN8Hg5zjEOZWAHgDACcAYCb6wHWp0dRBziabSzcv9sfe7wWHS9kBYAzAHAGAG51Ohn3zr4wOlk/jTrC+cW7Rye/4kbk8So93s/Rt8J2+HtbAeAMAJwBgOuFL2zt3C70AOEccvnKtZqHpBRlv9fx8L09gP4zAHAGAG6uBygzWNuIWydQo8L/+WWsAHAGAM4AwP0DeDu9JlWY924AAAAASUVORK5CYII=" | base64 -d > src/main/resources/logo.png
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Build
+        shell: bash
+        run: |
+          set +e
+          gradle build --no-daemon --console=plain > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo
+            echo "################ THE ERRORS ARE HERE ################"
+            if grep -q "error:" build.log; then
+              grep -n "error:" -A3 build.log | head -60
+            else
+              grep -n -E "What went wrong|Caused by|Could not|FAILED" -A4 build.log | head -60
+            fi
+            echo "################ END OF ERRORS ################"
+          fi
+          exit $status
+
+      - name: Upload full log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: unused-unlocked-1.4.0
+          path: build/libs/*.jar
+          if-no-files-found: error
